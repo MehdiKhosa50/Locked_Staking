@@ -7,99 +7,145 @@ import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "hardhat/console.sol";
 
-contract LockedStaking is ReentrancyGuard, Ownable(msg.sender) {
+contract Staking is ReentrancyGuard, Ownable(msg.sender) {
     using SafeMath for uint256;
-
     IERC20 public s_stakingToken;
     IERC20 public s_rewardToken;
 
-    uint256 public rewardMultiplier = 2;
+    uint256 public rewardRate;
+    uint256 private totalStakedTokens;
+    uint256 public rewardPerTokenStored;
+    uint256 public lastUpdateTime;
     uint256 public constant POINTS_PER_TOKEN = 100 ether;
-    uint256 public lockPeriod;
-    uint256 public totalStakedTokens;
+
+    uint256 public lockDuration;
+    uint256 public lockEndTime;
+    bool public isLocked;
 
     struct StakeInfo {
         uint256 amount;
-        uint256 startTime;
-        uint256 endTime;
-        uint256 pendingRewards;
-        bool isActive;
+        uint256 lockStartTime;
+        bool hasStaked;
     }
 
-    mapping(address => StakeInfo) public stakes;
+    mapping(address => StakeInfo) public userStakeInfo;
+    mapping(address => uint256) public rewards;
+    mapping(address => uint256) public userRewardPerTokenPaid;
 
-    event Staked(address indexed user, uint256 amount, uint256 lockEndTime);
-    event Withdrawn(address indexed user, uint256 amount, uint256 rewards);
-    event RewardsClaimed(address indexed user, uint256 amount);
-    event RewardMultiplierUpdated(uint256 oldRate, uint256 newRate);
+    event Staked(
+        address indexed user,
+        uint256 indexed amount,
+        uint256 points,
+        uint256 lockStartTime
+    );
+    event Withdrawn(
+        address indexed user,
+        uint256 indexed amount,
+        uint256 points
+    );
+    event RewardsClaimed(address indexed user, uint256 indexed amount);
+    event RewardRateUpdated(uint256 oldRate, uint256 newRate);
+    event LockStatusChanged(bool indexed isLocked);
+    event LockDurationSet(uint256 duration);
 
-    constructor(
-        address stakingToken,
-        address rewardToken,
-        uint256 _lockPeriod
-    ) {
-        require(_lockPeriod > 0, "Lock period must be greater than 0");
+    constructor(address stakingToken, address rewardToken) {
         s_stakingToken = IERC20(stakingToken);
         s_rewardToken = IERC20(rewardToken);
-        lockPeriod = _lockPeriod;
+        rewardRate = 1;
+        lockDuration = 60 seconds;
+        isLocked = true;
+        lockEndTime = block.timestamp + lockDuration;
     }
 
     function calculatePoints(uint256 amount) public pure returns (uint256) {
-        return (amount * 1e18) / POINTS_PER_TOKEN;
+        return ((amount * 1e18) / POINTS_PER_TOKEN);
     }
 
-    function calculateRewards(address user) public view returns (uint256) {
-        StakeInfo storage stakeInfo = stakes[user];
-        if (!stakeInfo.isActive) return 0;
+    function updateRewardRate(uint256 newRate) external onlyOwner {
+        require(newRate > 0, "Reward rate must be greater than 0");
+        uint256 oldRate = rewardRate;
+        console.log("Old Reward Rate", rewardRate);
 
-        uint256 currentTime = block.timestamp;
-        console.log("current time: ", currentTime);
-        uint256 endTime = stakeInfo.endTime;
-        console.log("end time: ", endTime);
+        rewardPerTokenStored = rewardPerToken();
+        lastUpdateTime = block.timestamp;
 
-        uint256 calculatedPoints = calculatePoints(stakeInfo.amount);
-        console.log("calculated points: ", calculatedPoints);
-        uint256 duration;
+        rewardRate = newRate;
+        console.log("New Reward Rate", rewardRate);
+        emit RewardRateUpdated(oldRate, newRate);
+    }
 
-        if (currentTime < endTime) {
-            duration = currentTime.sub(stakeInfo.startTime);
-        } else {
-            duration = endTime.sub(stakeInfo.startTime);
+    function rewardPerToken() public view returns (uint256) {
+        if (totalStakedTokens == 0) {
+            return rewardPerTokenStored;
         }
+        uint256 totalTime = block.timestamp.sub(lastUpdateTime);
+        console.log("Total Time", totalTime);
 
-        return calculatedPoints.mul(rewardMultiplier).mul(duration);
+        uint256 totalRewards = rewardRate.mul(totalTime);
+        // console.log("Total Rewards", totalRewards);
+
+        return
+            rewardPerTokenStored.add(
+                totalRewards.mul(1e18).div(totalStakedTokens)
+            );
     }
 
-    function updateRewardMultiplier(uint256 newMultiplier) external onlyOwner {
-        require(newMultiplier > 0, "Multiplier must be greater than 0");
-        uint256 oldMultiplier = rewardMultiplier;
-        rewardMultiplier = newMultiplier;
-        console.log("old: ", oldMultiplier);
-        console.log("new: ", newMultiplier);
-        emit RewardMultiplierUpdated(oldMultiplier, newMultiplier);
+    function earned(address account) public view returns (uint256) {
+        return
+            userStakeInfo[account]
+                .amount
+                .mul(rewardPerToken().sub(userRewardPerTokenPaid[account]))
+                .div(1e18)
+                .add(rewards[account]);
     }
 
-    function stake(uint256 amount) external nonReentrant {
+    modifier updateReward(address account) {
+        rewardPerTokenStored = rewardPerToken();
+        uint256 currentTime = block.timestamp - lastUpdateTime;
+        console.log("Time Staked: ", currentTime);
+        lastUpdateTime = block.timestamp;
+        console.log("lastUpdateTime", lastUpdateTime);
+        uint256 earnedRewards = earned(account);
+        rewards[account] = earnedRewards;
+        console.log("Rewards: ", earnedRewards);
+        userRewardPerTokenPaid[account] = rewardPerTokenStored;
+        _;
+    }
+
+    modifier checkLockStatus() {
+        if (block.timestamp >= lockEndTime && isLocked) {
+            isLocked = false;
+            emit LockStatusChanged(false);
+        }
+        _;
+    }
+
+    function stake(uint256 amount)
+        external
+        nonReentrant
+        updateReward(msg.sender)
+        checkLockStatus
+    {
         require(amount > 0, "Amount must be greater than zero");
-        require(!stakes[msg.sender].isActive, "Already has active stake");
 
-        uint256 startTime = block.timestamp;
-        console.log("start time: ", startTime);
-        uint256 endTime = startTime.add(lockPeriod);
-        console.log("end time: ", endTime);
-
-        stakes[msg.sender] = StakeInfo({
+        // Reset staking info for new stake
+        userStakeInfo[msg.sender] = StakeInfo({
             amount: amount,
-            startTime: startTime,
-            endTime: endTime,
-            pendingRewards: 0,
-            isActive: true
+            lockStartTime: block.timestamp,
+            hasStaked: true
         });
 
         totalStakedTokens = totalStakedTokens.add(amount);
+        uint256 points = calculatePoints(userStakeInfo[msg.sender].amount);
 
-        emit Staked(msg.sender, amount, endTime);
+        // Reset lock status for new stake
+        if (!isLocked) {
+            isLocked = true;
+            lockEndTime = block.timestamp + lockDuration;
+            emit LockStatusChanged(true);
+        }
 
+        emit Staked(msg.sender, amount, points, block.timestamp);
         bool success = s_stakingToken.transferFrom(
             msg.sender,
             address(this),
@@ -108,76 +154,117 @@ contract LockedStaking is ReentrancyGuard, Ownable(msg.sender) {
         require(success, "Transfer Failed");
     }
 
-    function withdraw() external nonReentrant {
-        StakeInfo storage stakeInfo = stakes[msg.sender];
-        require(stakeInfo.isActive, "No active stake found");
+    function withdrawStakedTokens(uint256 amount)
+        external
+        nonReentrant
+        updateReward(msg.sender)
+        checkLockStatus
+    {
+        require(amount > 0, "Amount must be greater than zero");
         require(
-            block.timestamp >= stakeInfo.endTime,
-            "Lock period not ended yet"
+            userStakeInfo[msg.sender].amount >= amount,
+            "Staked amount not enough"
         );
 
-        uint256 amount = stakeInfo.amount;
-        console.log("amount: ", amount);
-        uint256 rewards = calculateRewards(msg.sender);
-        console.log("rewards: ", rewards);
+        if (isLocked) {
+            require(
+                block.timestamp >=
+                    userStakeInfo[msg.sender].lockStartTime + lockDuration,
+                "Tokens are still locked"
+            );
+        }
 
         totalStakedTokens = totalStakedTokens.sub(amount);
-        stakeInfo.isActive = false;
-        stakeInfo.amount = 0;
-        stakeInfo.pendingRewards = 0;
+        userStakeInfo[msg.sender].amount = userStakeInfo[msg.sender].amount.sub(
+            amount
+        );
 
-        emit Withdrawn(msg.sender, amount, rewards);
+        uint256 points = calculatePoints(userStakeInfo[msg.sender].amount);
+        emit Withdrawn(msg.sender, amount, points);
 
-        bool successStaking = s_stakingToken.transfer(msg.sender, amount);
-        require(successStaking, "Staking Token Transfer Failed");
-
-        if (rewards > 0) {
-            bool successRewards = s_rewardToken.transfer(msg.sender, rewards);
-            require(successRewards, "Reward Token Transfer Failed");
-            emit RewardsClaimed(msg.sender, rewards);
-        }
+        bool success = s_stakingToken.transfer(msg.sender, amount);
+        require(success, "Transfer Failed");
     }
 
-    function getStakeInfo(
-        address user
-    )
+    function getReward()
+        external
+        nonReentrant
+        updateReward(msg.sender)
+        checkLockStatus
+    {
+        require(
+            !userStakeInfo[msg.sender].hasStaked,
+            "Cannot claim rewards during lockDuration!"
+        );
+        uint256 reward = rewards[msg.sender];
+        require(reward > 0, "No rewards to claim");
+        rewards[msg.sender] = 0;
+        emit RewardsClaimed(msg.sender, reward);
+        bool success = s_rewardToken.transfer(msg.sender, reward);
+        require(success, "Transfer Failed");
+    }
+
+    // View Functions
+    function getCurrentRewardRate() external view returns (uint256) {
+        return rewardRate;
+    }
+
+    function getCurrentReward() external view returns (uint256) {
+        return earned(msg.sender);
+    }
+
+    function getPoints() external view returns (uint256) {
+        return calculatePoints(userStakeInfo[msg.sender].amount);
+    }
+
+    function getCurrentStakedBalance() external view returns (uint256) {
+        return userStakeInfo[msg.sender].amount;
+    }
+
+    function getTotalStakedTokens() external view returns (uint256) {
+        return totalStakedTokens;
+    }
+
+    function getRemainingLockTime(address user)
+        external
+        view
+        returns (uint256)
+    {
+        if (!isLocked || !userStakeInfo[user].hasStaked) {
+            return 0;
+        }
+        uint256 endTime = userStakeInfo[user].lockStartTime + lockDuration;
+        if (block.timestamp >= endTime) {
+            return 0;
+        }
+        return endTime - block.timestamp;
+    }
+
+    function UserStakingDetails(address user)
         external
         view
         returns (
-            uint256 amount,
-            uint256 startTime,
-            uint256 endTime,
+            uint256 stakedAmount,
             uint256 pendingRewards,
-            bool isActive
+            uint256 userPoints,
+            uint256 lockTimeRemaining,
+            bool locked
         )
     {
-        StakeInfo memory stakeInfo = stakes[user];
+        uint256 remainingTime = 0;
+        if (isLocked && userStakeInfo[user].hasStaked) {
+            uint256 endTime = userStakeInfo[user].lockStartTime + lockDuration;
+            if (block.timestamp < endTime) {
+                remainingTime = endTime - block.timestamp;
+            }
+        }
+
         return (
-            stakeInfo.amount,
-            stakeInfo.startTime,
-            stakeInfo.endTime,
-            calculateRewards(user),
-            stakeInfo.isActive
+            userStakeInfo[user].amount,
+            earned(user),
+            calculatePoints(userStakeInfo[user].amount),
+            remainingTime,
+            isLocked
         );
-    }
-
-    function getRemainingLockTime(
-        address user
-    ) external view returns (uint256) {
-        StakeInfo memory stakeInfo = stakes[user];
-        if (!stakeInfo.isActive) return 0;
-        if (block.timestamp >= stakeInfo.endTime) return 0;
-        return stakeInfo.endTime.sub(block.timestamp);
-    }
-
-    function setLockPeriod(uint256 _lockPeriod) external onlyOwner {
-        require(_lockPeriod > 0, "Lock period must be greater than 0");
-        console.log("Previous lock period: ", lockPeriod);
-        lockPeriod = _lockPeriod;
-        console.log("New lock period: ", _lockPeriod);
-    }
-
-    function getCurrentRewardMultiplier() external view returns (uint256) {
-        return rewardMultiplier;
     }
 }
